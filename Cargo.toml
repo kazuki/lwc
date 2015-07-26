@@ -1,0 +1,13 @@
+[package]
+name = "lwc"
+version = "0.1.0"
+authors = ["Kazuki Oikawa <k@oikw.org>"]
+description = "Large Wakame Collider"
+
+homepage = "https://github.com/kazuki/lwc"
+repository = "https://github.com/kazuki/lwc"
+readme = "README.md"
+keywords = ["p2p", "dht", "anonymous", "chat"]
+license = "AGPL-3.0"
+
+[dependencies]

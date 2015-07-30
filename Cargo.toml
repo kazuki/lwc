@@ -11,3 +11,7 @@ keywords = ["p2p", "dht", "anonymous", "chat"]
 license = "AGPL-3.0"
 
 [dependencies]
+rustc-serialize = "0.3"
+rmp = "0.4"
+rand = "0.3"
+time = "0.1"

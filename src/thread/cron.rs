@@ -118,6 +118,16 @@ impl Cron {
         }
     }
 
+    /// キューイングされているイベントの数を返却します
+    pub fn queued_events_count(&self) -> usize {
+        self.events.lock().unwrap().len()
+    }
+
+    /// 登録されている定期的に実行するタスクの数を返却します
+    pub fn periodic_tasks_count(&self) -> usize {
+        self.periodic_tasks.lock().unwrap().len()
+    }
+
     fn enqueue(events: &Arc<Mutex<BinaryHeap<EventEntry>>>, cond: &Arc<Condvar>,
                interval: u32, task: Task) {
         let cur = time::precise_time_ns() / 1000000; // [ms]
@@ -188,4 +198,86 @@ impl Drop for Cron {
         }
         self.thread.take().unwrap().join().unwrap();
     }
+}
+
+#[cfg(test)]
+use std::sync::{Semaphore};
+
+#[test]
+fn test_oneshot() {
+    let cron = Cron::new();
+    let sem = Arc::new(Semaphore::new(0));
+    let v = Arc::new(Mutex::new(0));
+    let t = time::precise_time_ns() / 1000000;
+    {
+        let sem = sem.clone();
+        let v = v.clone();
+        cron.enqueue_oneshot(100, Box::new(move || {
+            *v.lock().unwrap() = time::precise_time_ns() / 1000000;
+            sem.release();
+        }));
+    }
+    sem.acquire();
+    assert!((*v.lock().unwrap() - t) >= 100);
+    assert_eq!(cron.queued_events_count(), 0);
+}
+
+#[test]
+fn test_periodic_task() {
+    let cron = Cron::new();
+    let sem = Arc::new(Semaphore::new(0));
+    let v = Arc::new(Mutex::new(0));
+    let t = time::precise_time_ns() / 1000000;
+    let task_id = {
+        let sem = sem.clone();
+        let v = v.clone();
+        cron.register_periodic_task(10, Box::new(move || {
+            let mut x = v.lock().unwrap();
+            *x += 1;
+            if  *x == 10 {
+                sem.release();
+            }
+        }))
+    };
+    sem.acquire();
+    assert!(match *v.lock().unwrap() {
+        x if x >= 10 && x < 15 => true,
+        _ => false,
+    });
+    assert!(match time::precise_time_ns() / 1000000 - t {
+        x if x >= 100 && x < 200 => true,
+        _ => false,
+    });
+    assert_eq!(cron.periodic_tasks_count(), 1);
+    assert!(!cron.unregister_periodic_task(task_id + 1));
+    assert!(cron.unregister_periodic_task(task_id));
+    assert_eq!(cron.periodic_tasks_count(), 0);
+    std::thread::sleep_ms(100);
+    assert!(match *v.lock().unwrap() {
+        x if x >= 10 && x <= 15 => true,
+        _ => false,
+    });
+}
+
+#[test]
+fn test_dynamic_task() {
+    let cron = Cron::new();
+    let sem = Arc::new(Semaphore::new(-1));
+    let v = Arc::new(Mutex::new(0));
+    {
+        let sem = sem.clone();
+        let v = v.clone();
+        cron.enqueue_dynamic_periodic_task(10, Box::new(move || {
+            let mut x = v.lock().unwrap();
+            *x += 1;
+            sem.release();
+            if *x == 2 {
+                0
+            } else {
+                10
+            }
+        }));
+    };
+    sem.acquire();
+    assert!(*v.lock().unwrap() == 2);
 }

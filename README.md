@@ -1,6 +1,7 @@
 # Large Wakame Collider (LWC, 仮称)
 
 [![Build Status](https://travis-ci.org/kazuki/lwc.svg?branch=develop)](https://travis-ci.org/kazuki/lwc)
+[![Coverage Status](https://coveralls.io/repos/kazuki/lwc/badge.svg?branch=develop&service=github)](https://coveralls.io/github/kazuki/lwc?branch=develop)
 
 ![大型ワカメ衝突型加速器](https://yabumi.cc/14eb161b3908698811f058fc.svg)
 

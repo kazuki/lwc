@@ -1,7 +1,7 @@
 //! ネットワークモジュール
 
 use std::io::Result;
-use std::net::ToSocketAddrs;
+use std::net::SocketAddr;
 use std::fmt::Debug;
 use std::marker::{Sync, Send};
 use rustc_serialize::{Encodable, Decodable};
@@ -26,12 +26,12 @@ pub trait InquirySocket<TREQ: Serializable, TRES: Serializable> {
     /// 指定したリクエストメッセージを利用して `remote_ep` で指定するリモートに対して問合せを行う.
     ///
     /// レスポンスが帰ってきた場合や応答がなかった場合は `callback` が呼び出される．
-    fn inquire<EP, CB>(&mut self, msg: TREQ, remote_ep: EP, callback: CB) -> Result<()>
-        where EP: ToSocketAddrs+Clone+Send+Sync+Debug, CB: Fn(Option<TRES>)+Send+Sync;
+    fn inquire<CB>(&mut self, msg: TREQ, remote_ep: &SocketAddr, callback: CB) -> Result<()>
+        where CB: Fn(Option<TRES>)+Send+Sync;
 }
 
 /// 再送タイムアウトを求めるアルゴリズム
-pub trait RetransmissionTimerAlgorithm<T> {
+pub trait RetransmissionTimerAlgorithm<T: Send + Sync>: Sync+Send {
     /// 往復時間情報を追加します
     ///
     /// メッセージ送信時間(相対時刻[ms]), 往復時間([ms]), 再送数を指定して
@@ -40,5 +40,5 @@ pub trait RetransmissionTimerAlgorithm<T> {
     fn add_sample(&self, key: &T, time: u64, rtt: u32, retransmit_cnt: u32);
 
     /// 再送タイムアウト時間[ms]を取得します
-    fn get_rto(&self, key: &T) -> u32;
+    fn get_rto(&self, key: &T, retransmit_count: u32) -> u32;
 }

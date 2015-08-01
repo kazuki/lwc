@@ -1,7 +1,5 @@
-#![feature(slice_bytes)]
-#![cfg_attr(test, feature(semaphore))]
-#![cfg_attr(test, feature(vec_resize))]
-#![cfg_attr(test, feature(ip_addr))]
+#![feature(slice_bytes, ip_addr)]
+#![cfg_attr(test, feature(semaphore, vec_resize))]
 
 extern crate rustc_serialize;
 extern crate rmp;

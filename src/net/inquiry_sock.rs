@@ -99,8 +99,7 @@ impl<DS: 'static+DatagramSocket+Sync+Send, SERDE: 'static+SerDe, TREQ: 'static+S
                                       waiting_map: Arc<RwLock<HashMap<u32, WaitingEntry<TREQ, TRES>>>>,
                                       rto: Arc<RTO>) {
         let mut buf = [0u8; 2048]; // TODO: Max Datagram Size
-        let mut panic_flag = false;
-        while !panic_flag && !flag.load(Ordering::Relaxed) {
+        while !flag.load(Ordering::Relaxed) {
             let (size, remote_ep) = match sock.recv_from(&mut buf) {
                 Ok((v0, v1)) => (v0, v1),
                 Err(e) => {
@@ -120,14 +119,14 @@ impl<DS: 'static+DatagramSocket+Sync+Send, SERDE: 'static+SerDe, TREQ: 'static+S
                 Some(m) => m,
                 _ => continue,
             };
-            let ret = match msg {
+            match msg {
                 InquiryMessage::Request(req) => {
                     let res = handler(req.body);
                     let msg = serde.serialize(&InquiryMessage::Response::<TREQ, TRES>(InquiryResponseMessage {
                         id: req.id,
                         body: res,
                     })).unwrap();
-                    Self::send_msg(&sock, &msg, &remote_ep, &flag)
+                    Self::send_msg(&sock, &msg, &remote_ep, &flag).unwrap();
                 },
                 InquiryMessage::Response(res) => {
                     match waiting_map.write().unwrap().remove(&res.id) {
@@ -139,19 +138,8 @@ impl<DS: 'static+DatagramSocket+Sync+Send, SERDE: 'static+SerDe, TREQ: 'static+S
                         },
                         _ => (),
                     }
-                    Ok(())
                 },
-            };
-            match ret {
-                Ok(_) => (),
-                Err(_) => {
-                    panic_flag = true;
-                    break;
-                }
             }
-        }
-        if panic_flag {
-            panic!("thread exit from unknown reason");
         }
     }
 

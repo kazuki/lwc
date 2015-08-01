@@ -20,7 +20,6 @@ const MAX_RTO: u32 = 10 * 1000;
 struct State {
     srtt: i32,
     rttvar: i32,
-    rto: u32,
 }
 
 impl<T: Sync + Send + Hash + Eq + Clone> RFC6298BasedRTO<T> {
@@ -41,17 +40,17 @@ impl<T: Sync + Send + Hash + Eq + Clone> RetransmissionTimerAlgorithm<T> for RFC
         let mut locked = self.state.write().unwrap();
         match locked.get_mut(key) {
             Some(s) => {
-                s.update(rtt, self.clock_granularity, self.min_rto);
+                s.update(rtt);
                 return;
             }
             _ => ()
         }
-        locked.insert(key.clone(), State::new(rtt, self.clock_granularity));
+        locked.insert(key.clone(), State::new(rtt));
     }
 
     fn get_rto(&self, key: &T, retransmit_count: u32) -> u32 {
         let rto = match self.state.read().unwrap().get(key) {
-            Some(s) => s.rto,
+            Some(s) => s.get_rto(self.clock_granularity, self.min_rto),
             _ => DEFAULT_RTO,
         };
         if retransmit_count == 0 {
@@ -63,24 +62,25 @@ impl<T: Sync + Send + Hash + Eq + Clone> RetransmissionTimerAlgorithm<T> for RFC
 }
 
 impl State {
-    fn new(rtt: u32, clock_granularity: u32) -> State {
+    fn new(rtt: u32) -> State {
         State {
             srtt: (rtt * 8) as i32,
             rttvar: (rtt * 2) as i32,
-            rto: (rtt + max(clock_granularity, rtt * 2)) as u32,
         }
     }
 
-    fn update(&mut self, rtt: u32, clock_granularity: u32, min_rto: u32) {
+    fn update(&mut self, rtt: u32) {
         let mut rtt = (rtt as i32) - (self.srtt >> 3);
         self.srtt += rtt;
         if rtt < 0 {
             rtt = -rtt;
         }
         self.rttvar -= (self.rttvar >> 2) - rtt;
+    }
 
+    fn get_rto(&self, clock_granularity: u32, min_rto: u32) -> u32 {
         let rto = (self.srtt >> 3) as u32 + max(clock_granularity, self.rttvar as u32);
-        self.rto = min(MAX_RTO, max(min_rto, rto));
+        min(MAX_RTO, max(min_rto, rto))
     }
 }
 

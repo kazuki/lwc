@@ -3,7 +3,7 @@ use ::thread::{Cron};
 use ::io::{SerDe};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::io::{Error, ErrorKind, Result};
+use std::io::{Error, Result};
 use std::marker::{Sync, Send, PhantomData};
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -27,11 +27,11 @@ pub struct SimpleInquirySocket<DS: DatagramSocket, SERDE: SerDe, TREQ: Serializa
 }
 
 struct WaitingEntry<TREQ: Serializable, TRES: Serializable> {
-    pub req: InquiryMessage<TREQ, TRES>,
+    pub req: TREQ,
+    pub req_bin: Arc<Vec<u8>>,
     pub ep: SocketAddr,
-    pub callback: Box<Fn(Option<TRES>)+Send+Sync>,
+    pub callback: Box<Fn(TREQ, Option<TRES>)+Send+Sync>,
     pub transmit_time: u64,
-    pub retransmit: Box<Fn(&InquiryMessage<TREQ, TRES>)+Send+Sync>,
     pub retransmit_count: AtomicUsize,
 }
 
@@ -123,11 +123,11 @@ impl<DS: 'static+DatagramSocket+Sync+Send, SERDE: 'static+SerDe, TREQ: 'static+S
             let ret = match msg {
                 InquiryMessage::Request(req) => {
                     let res = handler(req.body);
-                    let msg = InquiryMessage::Response::<TREQ, TRES>(InquiryResponseMessage {
+                    let msg = serde.serialize(&InquiryMessage::Response::<TREQ, TRES>(InquiryResponseMessage {
                         id: req.id,
                         body: res,
-                    });
-                    Self::send_msg(&sock, &serde, &msg, &remote_ep, &flag)
+                    })).unwrap();
+                    Self::send_msg(&sock, &msg, &remote_ep, &flag)
                 },
                 InquiryMessage::Response(res) => {
                     match waiting_map.write().unwrap().remove(&res.id) {
@@ -135,7 +135,7 @@ impl<DS: 'static+DatagramSocket+Sync+Send, SERDE: 'static+SerDe, TREQ: 'static+S
                             let rtt = ((time::precise_time_ns() / 1000000) - entry.transmit_time) as u32;
                             rto.add_sample(&entry.ep.ip(), entry.transmit_time, rtt,
                                            entry.retransmit_count.load(Ordering::Relaxed) as u32);
-                            (entry.callback)(Option::Some(res.body));
+                            (entry.callback)(entry.req, Option::Some(res.body));
                         },
                         _ => (),
                     }
@@ -155,16 +155,10 @@ impl<DS: 'static+DatagramSocket+Sync+Send, SERDE: 'static+SerDe, TREQ: 'static+S
         }
     }
 
-    fn send_msg<T>(sock: &DS, serde: &SERDE, msg: &T, remote_ep: &SocketAddr, flag: &AtomicBool) -> Result<()>
-        where T: Serializable
+    fn send_msg(sock: &DS, msg: &[u8], remote_ep: &SocketAddr, flag: &AtomicBool) -> Result<()>
     {
-        // TODO: 再送時にシリアライザが再度走るのもムダなので，バイト列を受け取るようにする
-        let msg_bin = match serde.serialize(msg) {
-            Some(m) => m,
-            _ => return Err(Error::new(ErrorKind::InvalidInput, "serialization error"))
-        };
         while !flag.load(Ordering::Relaxed) {
-            match sock.send_to(&msg_bin, remote_ep) {
+            match sock.send_to(&msg, remote_ep) {
                 Ok(_) => return Ok(()),
                 Err(e) => {
                     if DS::is_would_block_err(&e) {
@@ -180,6 +174,7 @@ impl<DS: 'static+DatagramSocket+Sync+Send, SERDE: 'static+SerDe, TREQ: 'static+S
     }
 
     fn set_timeout(&self, id: u32) {
+        let sock = self.sock.clone();
         let waiting_map = self.waiting_map.clone();
         let rto = self.rto.clone();
         let timeout = match waiting_map.read().unwrap().get(&id) {
@@ -187,7 +182,7 @@ impl<DS: 'static+DatagramSocket+Sync+Send, SERDE: 'static+SerDe, TREQ: 'static+S
             _ => return,
         };
         self.cron.enqueue_dynamic_periodic_task(timeout, Box::new(move || -> u32 {
-            {
+            let retransmit_info = {
                 let locked = waiting_map.read().unwrap();
                 let entry = match locked.get(&id) {
                     None => return 0,
@@ -195,19 +190,27 @@ impl<DS: 'static+DatagramSocket+Sync+Send, SERDE: 'static+SerDe, TREQ: 'static+S
                 };
                 let retransmit_count = entry.retransmit_count.fetch_add(1, Ordering::SeqCst);
                 if retransmit_count < 3 {
-                    // lifetimeの都合上，共有ロック内でsemd_msgしている..
-                    (entry.retransmit)(&entry.req);
-                    return rto.get_rto(&entry.ep.ip(), 1 + retransmit_count as u32);
+                    Some((entry.req_bin.clone(), entry.ep.clone(),
+                          rto.get_rto(&entry.ep.ip(), 1 + retransmit_count as u32)))
+                } else {
+                    None
+                }
+            };
+            match retransmit_info {
+                Some((req, ep, rto)) => {
+                    Self::send_msg(&sock, &req, &ep, &AtomicBool::new(false)).unwrap();
+                    rto
+                },
+                _ => {
+                    match waiting_map.write().unwrap().remove(&id) {
+                        Some(entry) => {
+                            (entry.callback)(entry.req, None);
+                        },
+                        _ => (),
+                    }
+                    0
                 }
             }
-
-            match waiting_map.write().unwrap().remove(&id) {
-                Some(entry) => {
-                    (entry.callback)(None);
-                },
-                _ => (),
-            }
-            0
         }));
     }
 
@@ -225,7 +228,7 @@ impl<DS: DatagramSocket, SERDE: SerDe, TREQ: Serializable, TRES: Serializable, R
 
 impl<DS: 'static+DatagramSocket+Sync+Send, SERDE: 'static+SerDe, TREQ: 'static+Serializable, TRES: 'static+Serializable, RTO: 'static+RetransmissionTimerAlgorithm<IpAddr>> InquirySocket<TREQ, TRES> for SimpleInquirySocket<DS, SERDE, TREQ, TRES, RTO> {
     fn inquire<CB>(&mut self, msg: TREQ, remote_ep: &SocketAddr, callback: CB) -> Result<()>
-        where CB: 'static+Fn(Option<TRES>)+Send+Sync
+        where CB: 'static+Fn(TREQ, Option<TRES>)+Send+Sync
     {
         let (id, req) = {
             // ユニークなIDを乱数より生成ために，登録先Mapの排他ロックを獲得しておく
@@ -235,27 +238,27 @@ impl<DS: 'static+DatagramSocket+Sync+Send, SERDE: 'static+SerDe, TREQ: 'static+S
                 id = self.reqid_rng.next_u32();
             }
 
-            let sock = self.sock.clone();
-            let serde = self.serde.clone();
             let remote_ep = remote_ep.clone();
+            let req = InquiryMessage::Request::<TREQ, TRES>(InquiryRequestMessage {
+                id: id,
+                body: msg,
+            });
+            let req_bin = Arc::new(self.serde.serialize(&req).unwrap());
             let entry = WaitingEntry {
-                req: InquiryMessage::Request::<TREQ, TRES>(InquiryRequestMessage {
-                    id: id,
-                    body: msg,
-                }),
+                req: match req {
+                    InquiryMessage::Request(x) => x.body,
+                    _ => panic!(),
+                },
+                req_bin: req_bin.clone(),
                 ep: remote_ep.clone(),
                 callback: Box::new(callback),
                 transmit_time: time::precise_time_ns() / 1000000,
-                retransmit: Box::new(move |msg| {
-                    Self::send_msg(&sock, &serde, msg, &remote_ep, &AtomicBool::new(false)).unwrap();
-                }),
                 retransmit_count: AtomicUsize::new(0),
             };
-            let req = entry.req.clone(); // lifetimeの都合上，cloneする以外の方法が思いつかなかった(ロック外でsend_msgを呼び出したいので...)
             locked.insert(id, entry);
-            (id, req)
+            (id, req_bin)
         };
-        match Self::send_msg(&self.sock, &self.serde, &req, &remote_ep, &AtomicBool::new(false)) {
+        match Self::send_msg(&self.sock, &req, &remote_ep, &AtomicBool::new(false)) {
             Err(e) => {
                 self.waiting_map.write().unwrap().remove(&id).unwrap();
                 return Err(e);
@@ -288,7 +291,7 @@ fn test_echo() {
     let sem1 = Arc::new(Semaphore::new(0));
     {
         let sem0 = sem0.clone();
-        sock0.inquire("foo".to_string(), &sock1.raw_socket().local_addr().unwrap(), move |msg| {
+        sock0.inquire("foo".to_string(), &sock1.raw_socket().local_addr().unwrap(), move |_, msg| {
             sem0.release();
             match msg {
                 None => panic!("inquire failed #0"),
@@ -297,7 +300,7 @@ fn test_echo() {
         }).unwrap();
 
         let sem1 = sem1.clone();
-        sock1.inquire("bar".to_string(), &sock0.raw_socket().local_addr().unwrap(), move |msg| {
+        sock1.inquire("bar".to_string(), &sock0.raw_socket().local_addr().unwrap(), move |_, msg| {
             sem1.release();
             match msg {
                 None => panic!("inquire failed #1"),
@@ -311,7 +314,7 @@ fn test_echo() {
     let sem0 = Arc::new(Semaphore::new(0));
     {
         let sem0 = sem0.clone();
-        sock0.inquire("hoge".to_string(), &sock1.raw_socket().local_addr().unwrap(), move |msg| {
+        sock0.inquire("hoge".to_string(), &sock1.raw_socket().local_addr().unwrap(), move |_, msg| {
             sem0.release();
             match msg {
                 None => panic!("inquire failed #2"),
@@ -332,7 +335,7 @@ fn test_timeout() {
             let ep = sock.raw_socket().local_addr().unwrap();
             SocketAddr::new(ep.ip(), ep.port() + 1)
         };
-        sock.inquire("foo".to_string(), &invalid_ep, move |msg| {
+        sock.inquire("foo".to_string(), &invalid_ep, move |_, msg| {
             match msg {
                 None => sem.release(),
                 Some(_) => panic!("inquire failed"),

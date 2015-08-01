@@ -27,7 +27,7 @@ pub trait InquirySocket<TREQ: Serializable, TRES: Serializable> {
     ///
     /// レスポンスが帰ってきた場合や応答がなかった場合は `callback` が呼び出される．
     fn inquire<CB>(&mut self, msg: TREQ, remote_ep: &SocketAddr, callback: CB) -> Result<()>
-        where CB: Fn(Option<TRES>)+Send+Sync;
+        where CB: Fn(TREQ, Option<TRES>)+Send+Sync;
 }
 
 /// 再送タイムアウトを求めるアルゴリズム

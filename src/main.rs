@@ -1,4 +1,4 @@
-#![feature(slice_bytes, ip_addr)]
+#![feature(slice_bytes, ip_addr, fnbox)]
 #![cfg_attr(test, feature(semaphore, vec_resize))]
 
 extern crate rustc_serialize;

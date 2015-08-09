@@ -1,77 +1,70 @@
 use super::{DatagramSocket, InquirySocket, Serializable, SocketEventType, RetransmissionTimerAlgorithm};
 use ::thread::{Cron};
 use ::io::{SerDe};
+use std::any::{Any, TypeId};
+use std::boxed::FnBox;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::io::{Error, Result};
-use std::marker::{Sync, Send, PhantomData};
-use std::sync::{Arc, RwLock};
+use std::io::{Error, ErrorKind, Result};
+use std::marker::{Sync, Send};
+use std::sync::{Arc, RwLock, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{JoinHandle, spawn};
-use rustc_serialize::{Encoder, Encodable, Decoder};
 use rand::{IsaacRng, Rng, SeedableRng, thread_rng};
 use time;
 
 /// データグラム上で`InquirySocket`を実現する
-pub struct SimpleInquirySocket<DS: DatagramSocket, SERDE: SerDe, TREQ: Serializable, TRES: Serializable, RTO: RetransmissionTimerAlgorithm<IpAddr>> {
+pub struct SimpleInquirySocket<DS: DatagramSocket, SERDE: SerDe, RTO: RetransmissionTimerAlgorithm<IpAddr>> {
     sock: Arc<DS>,
     serde: Arc<SERDE>,
     exit_flag: Arc<AtomicBool>,
-    recv_thread: Option<JoinHandle<()>>,
-    reqid_rng: IsaacRng,
-    waiting_map: Arc<RwLock<HashMap<u32, WaitingEntry<TREQ, TRES>>>>,
+    threads: Option<Vec<JoinHandle<()>>>,
+    reqid_rng: Mutex<IsaacRng>,
+    waiting_map: Arc<RwLock<HashMap<u32, WaitingEntry>>>,
+    handlers: Arc<RwLock<HashMap<u32, HandlerEntry>>>,
+    handler_types: Arc<RwLock<HashMap<TypeId, (u32, TypeId)>>>,
     cron: Arc<Cron>,
     rto: Arc<RTO>,
-    _0: PhantomData<TREQ>,
-    _1: PhantomData<TRES>,
 }
 
-struct WaitingEntry<TREQ: Serializable, TRES: Serializable> {
-    pub req: TREQ,
-    pub req_bin: Arc<Vec<u8>>,
+struct HandlerEntry {
+    pub handler: Box<Fn(u32,&[u8])->Option<Vec<u8>>+Send+Sync>,
+    pub req_type: TypeId,
+    pub res_type: TypeId,
+}
+
+struct WaitingEntry {
     pub ep: SocketAddr,
-    pub callback: Box<Fn(TREQ, Option<TRES>)+Send+Sync>,
+    pub req_bin: Arc<Vec<u8>>,
+    pub callback: Box<FnBox(&[u8])+Send+Sync>,
     pub transmit_time: u64,
     pub retransmit_count: AtomicUsize,
 }
 
-#[derive(RustcDecodable, RustcEncodable, Clone, Debug)]
-enum InquiryMessage<TREQ: Serializable, TRES: Serializable> {
-    Request(InquiryRequestMessage<TREQ>),
-    Response(InquiryResponseMessage<TRES>),
-}
-
-#[derive(RustcDecodable, RustcEncodable, Clone, Debug)]
-struct InquiryRequestMessage<T: Serializable> {
-    pub id: u32,
-    pub body: T,
-}
-
-#[derive(RustcDecodable, RustcEncodable, Clone, Debug)]
-struct InquiryResponseMessage<T: Serializable> {
-    pub id: u32,
-    pub body: T,
-}
-
-impl<DS: 'static+DatagramSocket+Sync+Send, SERDE: 'static+SerDe, TREQ: 'static+Serializable, TRES: 'static+Serializable, RTO: 'static+RetransmissionTimerAlgorithm<IpAddr>> SimpleInquirySocket<DS, SERDE, TREQ, TRES, RTO> {
-    pub fn new<H: 'static+Send+Fn(TREQ)->TRES>(sock: DS, serde: SERDE, handler: H, rto: RTO) -> SimpleInquirySocket<DS, SERDE, TREQ, TRES, RTO> {
+impl<DS: 'static+DatagramSocket, SERDE: 'static+SerDe, RTO: 'static+RetransmissionTimerAlgorithm<IpAddr>> SimpleInquirySocket<DS, SERDE, RTO> {
+    pub fn new(sock: DS, serde: SERDE, rto: RTO, num_threads: usize) -> SimpleInquirySocket<DS, SERDE, RTO> {
         sock.set_blocking(false).unwrap();
         let flag = Arc::new(AtomicBool::new(false));
         let sock = Arc::new(sock);
         let serde = Arc::new(serde);
         let waiting_map = Arc::new(RwLock::new(HashMap::new()));
+        let handlers = Arc::new(RwLock::new(HashMap::new()));
+        let handler_types = Arc::new(RwLock::new(HashMap::new()));
         let cron = Arc::new(Cron::new());
         let rto = Arc::new(rto);
-        let thread_handle = {
-            let flag = flag.clone();
-            let sock = sock.clone();
-            let serde = serde.clone();
-            let waiting_map = waiting_map.clone();
-            let rto = rto.clone();
-            spawn(move || {
-                Self::recv_thread(sock, serde, handler, flag, waiting_map, rto);
-            })
-        };
+        let mut threads = Vec::new();
+        for _ in 0..num_threads {
+            threads.push({
+                let flag = flag.clone();
+                let sock = sock.clone();
+                let waiting_map = waiting_map.clone();
+                let handlers = handlers.clone();
+                let rto = rto.clone();
+                spawn(move || {
+                    Self::recv_thread(sock, flag, waiting_map, handlers, rto);
+                })
+            });
+        }
         let rng_seed = {
             let mut rng_seed = [0u32, 32];
             let mut rng = thread_rng();
@@ -84,61 +77,73 @@ impl<DS: 'static+DatagramSocket+Sync+Send, SERDE: 'static+SerDe, TREQ: 'static+S
             sock: sock,
             serde: serde,
             exit_flag: flag,
-            recv_thread: Option::Some(thread_handle),
-            reqid_rng: IsaacRng::from_seed(&rng_seed),
+            threads: Option::Some(threads),
+            reqid_rng: Mutex::new(IsaacRng::from_seed(&rng_seed)),
             waiting_map: waiting_map,
+            handlers: handlers,
+            handler_types: handler_types,
             cron: cron,
             rto: rto,
-            _0: PhantomData,
-            _1: PhantomData,
         }
     }
 
-    /// 受信およびメッセージハンドラー実行スレッド
-    fn recv_thread<H: Fn(TREQ)->TRES>(sock: Arc<DS>, serde: Arc<SERDE>, handler: H, flag: Arc<AtomicBool>,
-                                      waiting_map: Arc<RwLock<HashMap<u32, WaitingEntry<TREQ, TRES>>>>,
-                                      rto: Arc<RTO>) {
+    fn recv_thread(sock: Arc<DS>, exit_flag: Arc<AtomicBool>,
+                   waiting_map: Arc<RwLock<HashMap<u32, WaitingEntry>>>,
+                   handlers: Arc<RwLock<HashMap<u32, HandlerEntry>>>, rto: Arc<RTO>) {
         let mut buf = [0u8; 2048]; // TODO: Max Datagram Size
-        while !flag.load(Ordering::Relaxed) {
+        while !exit_flag.load(Ordering::Relaxed) {
             let (size, remote_ep) = match sock.recv_from(&mut buf) {
                 Ok((v0, v1)) => (v0, v1),
                 Err(e) => {
-                    if flag.load(Ordering::Relaxed) {
+                    if exit_flag.load(Ordering::Relaxed) {
                         return;
-                    }
-                    if DS::is_would_block_err(&e) {
+                    } else if DS::is_would_block_err(&e) {
                         match sock.poll(100, SocketEventType::Read) {
                             _ => continue
                         }
                     } else {
-                        break;
+                        panic!();
                     }
                 },
             };
-            let msg: InquiryMessage<TREQ, TRES> = match serde.deserialize(&buf[..size]) {
-                Some(m) => m,
-                _ => continue,
+
+            // IDとリクエスト・レスポンスを識別するフラグをパースする
+            if size < 4 {
+                continue;
+            }
+            let (id, is_req) = {
+                let x = (buf[0] as u32) | ((buf[1] as u32) << 8) | ((buf[2] as u32) << 16) | ((buf[3] as u32) << 24);
+                (x & 0x7fffffff, (x >> 31) == 0)
             };
-            match msg {
-                InquiryMessage::Request(req) => {
-                    let res = handler(req.body);
-                    let msg = serde.serialize(&InquiryMessage::Response::<TREQ, TRES>(InquiryResponseMessage {
-                        id: req.id,
-                        body: res,
-                    })).unwrap();
-                    Self::send_msg(&sock, &msg, &remote_ep, &flag).unwrap();
-                },
-                InquiryMessage::Response(res) => {
-                    match waiting_map.write().unwrap().remove(&res.id) {
-                        Some(entry) => {
-                            let rtt = ((time::precise_time_ns() / 1000000) - entry.transmit_time) as u32;
-                            rto.add_sample(&entry.ep.ip(), entry.transmit_time, rtt,
-                                           entry.retransmit_count.load(Ordering::Relaxed) as u32);
-                            (entry.callback)(entry.req, Option::Some(res.body));
-                        },
-                        _ => (),
+
+            if is_req {
+                if size < 8 {
+                    continue;
+                }
+                let type_id = (buf[4] as u32) | ((buf[5] as u32) << 8) | ((buf[6] as u32) << 16) | ((buf[7] as u32) << 24);
+                let res = {
+                    match handlers.read().unwrap().get(&type_id) {
+                        Some(v) => (v.handler)(id | 0x80000000, &buf[8..size]),
+                        None => None,
                     }
-                },
+                };
+
+                match res {
+                    Some(res) => {
+                        Self::send_msg(&sock, &res, &remote_ep, &exit_flag).unwrap();
+                    },
+                    None => (),
+                }
+            } else {
+                match waiting_map.write().unwrap().remove(&id) {
+                    Some(entry) => {
+                        let rtt = ((time::precise_time_ns() / 1000000) - entry.transmit_time) as u32;
+                        rto.add_sample(&entry.ep.ip(), entry.transmit_time, rtt,
+                                       entry.retransmit_count.load(Ordering::Relaxed) as u32);
+                        entry.callback.call_box((&buf[4..size],));
+                    },
+                    _ => (),
+                }
             }
         }
     }
@@ -192,7 +197,7 @@ impl<DS: 'static+DatagramSocket+Sync+Send, SERDE: 'static+SerDe, TREQ: 'static+S
                 _ => {
                     match waiting_map.write().unwrap().remove(&id) {
                         Some(entry) => {
-                            (entry.callback)(entry.req, None);
+                            entry.callback.call_box((&[0u8;0],));
                         },
                         _ => (),
                     }
@@ -207,55 +212,123 @@ impl<DS: 'static+DatagramSocket+Sync+Send, SERDE: 'static+SerDe, TREQ: 'static+S
     }
 }
 
-impl<DS: DatagramSocket, SERDE: SerDe, TREQ: Serializable, TRES: Serializable, RTO: RetransmissionTimerAlgorithm<IpAddr>> Drop for SimpleInquirySocket<DS, SERDE, TREQ, TRES, RTO> {
-    fn drop(&mut self) {
-        self.exit_flag.store(true, Ordering::Relaxed);
-        self.recv_thread.take().unwrap().join().unwrap();
-    }
-}
-
-impl<DS: 'static+DatagramSocket+Sync+Send, SERDE: 'static+SerDe, TREQ: 'static+Serializable, TRES: 'static+Serializable, RTO: 'static+RetransmissionTimerAlgorithm<IpAddr>> InquirySocket<TREQ, TRES> for SimpleInquirySocket<DS, SERDE, TREQ, TRES, RTO> {
-    fn inquire<CB>(&mut self, msg: TREQ, remote_ep: &SocketAddr, callback: CB) -> Result<()>
-        where CB: 'static+Fn(TREQ, Option<TRES>)+Send+Sync
+impl<DS: 'static+DatagramSocket, SERDE: 'static+SerDe, RTO: 'static+RetransmissionTimerAlgorithm<IpAddr>> InquirySocket for SimpleInquirySocket<DS, SERDE, RTO> {
+    fn register_handler<T, TREQ, TRES>(&self, id: u32, handler: T) -> bool
+        where TREQ: Serializable, TRES: Serializable, T: 'static+Send+Sync+Fn(TREQ)->TRES
     {
+        let req_type = TypeId::of::<TREQ>();
+        let res_type = TypeId::of::<TRES>();
+        {
+            let mut locked = self.handler_types.write().unwrap();
+            if locked.contains_key(&req_type) {
+                return false;
+            }
+            locked.insert(req_type.clone(),
+                          (id.clone(), res_type.clone()));
+        }
+
+        let serde = self.serde.clone();
+        let handler = move |id: u32, binary: &[u8]| {
+            let req = match serde.deserialize(binary) {
+                None => return None,
+                Some(x) => x,
+            };
+            let mut buf = vec![
+                (id & 0xff) as u8,
+                ((id >> 8) & 0xff) as u8,
+                ((id >> 16) & 0xff) as u8,
+                ((id >> 24) & 0xff) as u8
+            ];
+            match serde.serialize(&mut buf, &handler(req)) {
+                Ok(_) => return Some(buf),
+                _ => return None,
+            }
+        };
+        let mut locked = self.handlers.write().unwrap();
+        if locked.contains_key(&id) {
+            self.handler_types.write().unwrap().remove(&req_type);
+            return false;
+        }
+        locked.insert(id, HandlerEntry {
+            handler: Box::new(handler),
+            req_type: req_type,
+            res_type: res_type,
+        });
+        return true;
+    }
+
+    fn inquire<TREQ, TRES, CB>(&self, msg: TREQ, remote_ep: &SocketAddr, callback: CB) -> Result<()>
+        where TREQ: Serializable, TRES: Serializable, CB: 'static+Fn(TREQ, Option<TRES>)+Send+Sync+Any
+    {
+        let type_id = match self.handler_types.read().unwrap().get(&TypeId::of::<TREQ>()) {
+            Some(&(type_id, _)) => type_id,
+            _ => return Err(Error::new(ErrorKind::InvalidInput, "unregistered request type")),
+        };
+
         let (id, req) = {
             // ユニークなIDを乱数より生成ために，登録先Mapの排他ロックを獲得しておく
             let mut locked = self.waiting_map.write().unwrap();
-            let mut id = self.reqid_rng.next_u32();
-            while locked.contains_key(&id) {
-                id = self.reqid_rng.next_u32();
-            }
+            let id = {
+                let mut rng = self.reqid_rng.lock().unwrap();
+                let mut id = rng.next_u32() & 0x7fffffff;
+                while locked.contains_key(&id) {
+                    id = rng.next_u32() & 0x7fffffff;
+                }
+                id
+            };
 
             let remote_ep = remote_ep.clone();
-            let req = InquiryMessage::Request::<TREQ, TRES>(InquiryRequestMessage {
-                id: id,
-                body: msg,
+            let req_bin = Arc::new({
+                let mut buf = vec![
+                    (id & 0xff) as u8,
+                    ((id >> 8) & 0xff) as u8,
+                    ((id >> 16) & 0xff) as u8,
+                    ((id >> 24) & 0xff) as u8,
+                    (type_id & 0xff) as u8,
+                    ((type_id >> 8) & 0xff) as u8,
+                    ((type_id >> 16) & 0xff) as u8,
+                    ((type_id >> 24) & 0xff) as u8,
+                ];
+                self.serde.serialize(&mut buf, &msg).unwrap();
+                buf
             });
-            let req_bin = Arc::new(self.serde.serialize(&req).unwrap());
+            let serde = self.serde.clone();
+            let callback_wrapper: Box<FnBox(&[u8])+Send+Sync> = Box::new(move |binary: &[u8]| {
+                if binary.len() == 0 {
+                    callback(msg, Option::None);
+                } else {
+                    let res: TRES = serde.deserialize(binary).unwrap();
+                    callback(msg, Option::Some(res));
+                }
+            });
             let entry = WaitingEntry {
-                req: match req {
-                    InquiryMessage::Request(x) => x.body,
-                    _ => panic!(),
-                },
                 req_bin: req_bin.clone(),
                 ep: remote_ep.clone(),
-                callback: Box::new(callback),
+                callback: callback_wrapper,
                 transmit_time: time::precise_time_ns() / 1000000,
                 retransmit_count: AtomicUsize::new(0),
             };
             locked.insert(id, entry);
             (id, req_bin)
         };
-        match Self::send_msg(&self.sock, &req, &remote_ep, &AtomicBool::new(false)) {
+        match Self::send_msg(&self.sock, &req, &remote_ep, &self.exit_flag) {
             Err(e) => {
                 self.waiting_map.write().unwrap().remove(&id).unwrap();
                 return Err(e);
             },
             _ => (),
         }
-
         self.set_timeout(id);
         Ok(())
+    }
+}
+
+impl<DS: DatagramSocket, SERDE: SerDe, RTO: RetransmissionTimerAlgorithm<IpAddr>> Drop for SimpleInquirySocket<DS, SERDE, RTO> {
+    fn drop(&mut self) {
+        self.exit_flag.store(true, Ordering::SeqCst);
+        for thread in self.threads.take().unwrap() {
+            thread.join().unwrap();
+        }
     }
 }
 
@@ -271,15 +344,24 @@ use std::sync::Semaphore;
 #[cfg(test)]
 use ::io::{MsgPackSerDe};
 
+#[cfg(test)]
+use ::net::RFC6298BasedRTO;
+
+#[cfg(test)]
+type EchoReqT = String;
+
+#[cfg(test)]
+type EchoResT = String;
+
 #[test]
 fn test_echo() {
-    let mut sock0 = new_sock(test_echo_handler);
-    let mut sock1 = new_sock(test_echo_handler);
+    let sock0 = new_sock();
+    let sock1 = new_sock();
     let sem0 = Arc::new(Semaphore::new(0));
     let sem1 = Arc::new(Semaphore::new(0));
     {
         let sem0 = sem0.clone();
-        sock0.inquire("foo".to_string(), &sock1.raw_socket().local_addr().unwrap(), move |_, msg| {
+        sock0.inquire("foo".to_string(), &sock1.raw_socket().local_addr().unwrap(), move |_: EchoReqT, msg: Option<EchoResT>| {
             sem0.release();
             match msg {
                 None => panic!("inquire failed #0"),
@@ -288,7 +370,7 @@ fn test_echo() {
         }).unwrap();
 
         let sem1 = sem1.clone();
-        sock1.inquire("bar".to_string(), &sock0.raw_socket().local_addr().unwrap(), move |_, msg| {
+        sock1.inquire("bar".to_string(), &sock0.raw_socket().local_addr().unwrap(), move |_: EchoReqT, msg: Option<EchoResT>| {
             sem1.release();
             match msg {
                 None => panic!("inquire failed #1"),
@@ -302,7 +384,7 @@ fn test_echo() {
     let sem0 = Arc::new(Semaphore::new(0));
     {
         let sem0 = sem0.clone();
-        sock0.inquire("hoge".to_string(), &sock1.raw_socket().local_addr().unwrap(), move |_, msg| {
+        sock0.inquire("hoge".to_string(), &sock1.raw_socket().local_addr().unwrap(), move |_: EchoReqT, msg: Option<EchoResT>| {
             sem0.release();
             match msg {
                 None => panic!("inquire failed #2"),
@@ -315,7 +397,7 @@ fn test_echo() {
 
 #[test]
 fn test_timeout() {
-    let mut sock = new_sock(test_echo_handler);
+    let sock = new_sock();
     let sem = Arc::new(Semaphore::new(0));
     {
         let sem = sem.clone();
@@ -323,7 +405,7 @@ fn test_timeout() {
             let ep = sock.raw_socket().local_addr().unwrap();
             SocketAddr::new(ep.ip(), ep.port() + 1)
         };
-        sock.inquire("foo".to_string(), &invalid_ep, move |_, msg| {
+        sock.inquire("foo".to_string(), &invalid_ep, move |_: EchoReqT, msg: Option<EchoResT>| {
             match msg {
                 None => sem.release(),
                 Some(_) => panic!("inquire failed"),
@@ -334,29 +416,17 @@ fn test_timeout() {
 }
 
 #[cfg(test)]
-fn test_echo_handler(req: EchoReqT) -> EchoResT {
-    let mut str = "echo: ".to_string();
-    str.push_str(&req);
-    str
-}
-
-#[cfg(test)]
-type EchoReqT = String;
-
-#[cfg(test)]
-type EchoResT = String;
-
-#[cfg(test)]
-use super::RFC6298BasedRTO;
-
-#[cfg(test)]
-fn new_sock<H, TREQ, TRES>(handler: H) -> SimpleInquirySocket<UdpSocket, MsgPackSerDe, TREQ, TRES, RFC6298BasedRTO<IpAddr>>
-    where H: 'static+Send+Fn(TREQ)->TRES, TREQ: 'static+Serializable, TRES: 'static+Serializable
-{
-    SimpleInquirySocket::new(
+fn new_sock() -> SimpleInquirySocket<UdpSocket, MsgPackSerDe, RFC6298BasedRTO<IpAddr>> {
+    let sock = SimpleInquirySocket::new(
         UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::from_str("0.0.0.0").unwrap(), 0)).unwrap(),
         MsgPackSerDe,
-        handler,
         RFC6298BasedRTO::new(1, 50),
-    )
+        2,
+    );
+    sock.register_handler(0, move |req: EchoReqT| {
+        let mut str = "echo: ".to_string();
+        str.push_str(&req);
+        str
+    });
+    sock
 }

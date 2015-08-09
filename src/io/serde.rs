@@ -1,11 +1,22 @@
 use std::marker::{Sync, Send};
+use std::io::Write;
+use std::result::Result;
 use rmp;
 use rustc_serialize::{Encodable, Decodable};
 
 /// `Encodable`/`Decodable`な型とバイナリ間のシリアライズ・デシリアライズを行う
 pub trait SerDe: Send+Sync {
     /// `Encodable`なオブジェクトをシリアライズする
-    fn serialize<T: Encodable>(&self, obj: &T) -> Option<Vec<u8>>;
+    fn serialize<T: Encodable>(&self, wr: &mut Write, obj: &T) -> Result<(), ()>;
+
+    /// `Encodable`なオブジェクトをシリアライズする
+    fn serialize_to_vec<T: Encodable>(&self, obj: &T) -> Option<Vec<u8>> {
+        let mut buf: Vec<u8> = Vec::new();
+        match self.serialize(&mut buf, obj) {
+            Ok(_) => Some(buf),
+            _ => None
+        }
+    }
 
     /// シリアライズされたバイナリを元に`Decodable`なオブジェクトへデシリアライズする
     fn deserialize<T: Decodable>(&self, binary: &[u8]) -> Option<T>;
@@ -15,12 +26,11 @@ pub trait SerDe: Send+Sync {
 pub struct MsgPackSerDe;
 
 impl SerDe for MsgPackSerDe {
-    fn serialize<T: Encodable>(&self, obj: &T) -> Option<Vec<u8>> {
-        let mut buf: Vec<u8> = Vec::new();
-        match obj.encode(&mut rmp::Encoder::new(&mut buf)) {
-            Ok(_) => Some(buf),
-            _ => None
-        }        
+    fn serialize<T: Encodable>(&self, wr: &mut Write, obj: &T) -> Result<(), ()> {
+        match obj.encode(&mut rmp::Encoder::new(wr)) {
+            Ok(_) => Ok(()),
+            _ => Err(()),
+        }
     }
 
     fn deserialize<T: Decodable>(&self, binary: &[u8]) -> Option<T> {
@@ -34,7 +44,7 @@ impl SerDe for MsgPackSerDe {
 #[test]
 fn test_msgpack_roundtrip() {
     let mp = MsgPackSerDe;
-    let bin = match mp.serialize(&SerDeTest(1234)) {
+    let bin = match mp.serialize_to_vec(&SerDeTest(1234)) {
         Some(x) => x,
         _ => panic!("err#1"),
     };
@@ -55,7 +65,7 @@ fn test_msgpack_roundtrip() {
     // i32とu32は互換性がない(符号の有無でMsgPackの型が異なる)ためエラー
     assert!(mp.deserialize::<SerDeTest4>(&bin).is_none());
 
-    let bin = match mp.serialize(&SerDeTest5::T1(SerDeTest4(-1234))) {
+    let bin = match mp.serialize_to_vec(&SerDeTest5::T1(SerDeTest4(-1234))) {
         Some(x) => x,
         _ => panic!("err#4"),
     };

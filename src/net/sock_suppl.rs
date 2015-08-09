@@ -1,4 +1,5 @@
 use std::net::{UdpSocket, SocketAddr, ToSocketAddrs};
+use std::marker::{Sync, Send};
 use std::io::{Result, Error, ErrorKind};
 use std::os::raw::{c_short, c_int, c_uint};
 use std::mem::transmute;
@@ -27,7 +28,7 @@ pub enum SocketEventType {
 }
 
 /// UdpSocketのサプリメント
-pub trait DatagramSocket {
+pub trait DatagramSocket: Send + Sync {
     /// See [std::net::UdpSocket::recv_from](http://doc.rust-lang.org/stable/std/net/struct.UdpSocket.html#method.recv_from)
     fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)>;
 
